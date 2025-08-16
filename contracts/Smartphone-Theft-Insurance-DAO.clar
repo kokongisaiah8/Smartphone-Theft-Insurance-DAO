@@ -165,10 +165,29 @@
 (define-constant ERR-NOT-VALIDATOR (err u110))
 (define-constant ERR-VALIDATOR-EXISTS (err u111))
 (define-constant ERR-INSUFFICIENT-STAKE (err u112))
+(define-constant ERR-DEVICE-NOT-FOUND (err u113))
+(define-constant ERR-MAX-DEVICES-REACHED (err u114))
+(define-constant ERR-DEVICE-ALREADY-EXISTS (err u115))
 
 (define-data-var validator-stake-required uint u50000000)
 (define-data-var validation-reward uint u5000000)
 (define-data-var required-validator-signatures uint u3)
+(define-data-var max-devices-per-user uint u5)
+
+(define-map user-devices
+    principal
+    {device-count: uint, total-premium: uint}
+)
+
+(define-map device-registry
+    {owner: principal, device-id: uint}
+    {imei: (string-ascii 15), last-payment: uint, device-type: (string-ascii 20)}
+)
+
+(define-map user-device-counter
+    principal
+    uint
+)
 
 (define-map validators
     principal
@@ -240,3 +259,66 @@
 
 (define-read-only (get-claim-validation-summary (claim-owner principal))
     (ok (map-get? claim-validation-summary claim-owner)))
+
+(define-public (register-multiple-device (imei (string-ascii 15)) (device-type (string-ascii 20)))
+    (let ((user-info (default-to {device-count: u0, total-premium: u0} (map-get? user-devices tx-sender)))
+          (device-counter (default-to u0 (map-get? user-device-counter tx-sender)))
+          (next-device-id (+ device-counter u1)))
+        (asserts! (< (get device-count user-info) (var-get max-devices-per-user)) ERR-MAX-DEVICES-REACHED)
+        (asserts! (is-none (map-get? device-registry {owner: tx-sender, device-id: next-device-id})) ERR-DEVICE-ALREADY-EXISTS)
+        (try! (stx-transfer? (var-get monthly-premium) tx-sender (as-contract tx-sender)))
+        (var-set insurance-pool (+ (var-get insurance-pool) (var-get monthly-premium)))
+        (map-set device-registry 
+            {owner: tx-sender, device-id: next-device-id}
+            {imei: imei, last-payment: stacks-block-height, device-type: device-type})
+        (map-set user-devices tx-sender
+            {device-count: (+ (get device-count user-info) u1),
+             total-premium: (+ (get total-premium user-info) (var-get monthly-premium))})
+        (map-set user-device-counter tx-sender next-device-id)
+        (ok next-device-id)))
+
+(define-public (pay-bulk-premiums)
+    (let ((user-info (map-get? user-devices tx-sender)))
+        (asserts! (is-some user-info) ERR-NOT-INSURED)
+        (let ((device-count (get device-count (unwrap-panic user-info)))
+              (total-payment (* device-count (var-get monthly-premium))))
+            (try! (stx-transfer? total-payment tx-sender (as-contract tx-sender)))
+            (var-set insurance-pool (+ (var-get insurance-pool) total-payment))
+            (map-set user-devices tx-sender
+                (merge (unwrap-panic user-info) {total-premium: (+ (get total-premium (unwrap-panic user-info)) total-payment)}))
+            (ok total-payment))))
+
+(define-public (file-device-claim (device-id uint))
+    (let ((device (map-get? device-registry {owner: tx-sender, device-id: device-id}))
+          (existing-claim (map-get? theft-claims tx-sender)))
+        (asserts! (is-some device) ERR-DEVICE-NOT-FOUND)
+        (asserts! (is-none existing-claim) ERR-CLAIM-EXISTS)
+        (ok (map-set theft-claims 
+            tx-sender 
+            {imei: (get imei (unwrap-panic device)), 
+             timestamp: stacks-block-height,
+             votes: u0,
+             processed: false}))))
+
+(define-public (remove-device (device-id uint))
+    (let ((device (map-get? device-registry {owner: tx-sender, device-id: device-id}))
+          (user-info (map-get? user-devices tx-sender)))
+        (asserts! (is-some device) ERR-DEVICE-NOT-FOUND)
+        (asserts! (is-some user-info) ERR-NOT-INSURED)
+        (map-delete device-registry {owner: tx-sender, device-id: device-id})
+        (map-set user-devices tx-sender
+            {device-count: (- (get device-count (unwrap-panic user-info)) u1),
+             total-premium: (- (get total-premium (unwrap-panic user-info)) (var-get monthly-premium))})
+        (ok true)))
+
+(define-read-only (get-user-devices (user principal))
+    (ok (map-get? user-devices user)))
+
+(define-read-only (get-device-details (user principal) (device-id uint))
+    (ok (map-get? device-registry {owner: user, device-id: device-id})))
+
+(define-read-only (get-all-user-device-ids (user principal))
+    (let ((user-info (map-get? user-devices user)))
+        (match user-info
+            info (ok (get device-count info))
+            (ok u0))))
