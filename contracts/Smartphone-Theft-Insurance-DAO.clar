@@ -322,3 +322,116 @@
         (match user-info
             info (ok (get device-count info))
             (ok u0))))
+
+(define-constant ERR-INVALID-RISK-SCORE (err u116))
+
+(define-data-var base-premium-multiplier uint u100)
+(define-data-var risk-adjustment-factor uint u20)
+
+(define-map user-risk-profile
+    principal
+    {risk-score: uint, 
+     claims-filed: uint, 
+     successful-claims: uint, 
+     payment-delays: uint, 
+     last-risk-update: uint,
+     premium-discount: uint}
+)
+
+(define-map device-risk-factors
+    (string-ascii 20)
+    {theft-rate: uint, premium-multiplier: uint}
+)
+
+(define-public (initialize-risk-factors)
+    (begin
+        (map-set device-risk-factors "smartphone" {theft-rate: u85, premium-multiplier: u100})
+        (map-set device-risk-factors "tablet" {theft-rate: u65, premium-multiplier: u80})
+        (map-set device-risk-factors "laptop" {theft-rate: u45, premium-multiplier: u120})
+        (map-set device-risk-factors "smartwatch" {theft-rate: u25, premium-multiplier: u60})
+        (map-set device-risk-factors "gaming-console" {theft-rate: u75, premium-multiplier: u110})
+        (ok true)))
+
+(define-private (calculate-risk-score (user principal))
+    (let ((profile (default-to {risk-score: u50, claims-filed: u0, successful-claims: u0, payment-delays: u0, last-risk-update: u0, premium-discount: u0}
+                              (map-get? user-risk-profile user)))
+          (claims-ratio (if (> (get claims-filed profile) u0)
+                          (/ (* (get successful-claims profile) u100) (get claims-filed profile))
+                          u0))
+          (base-score u50)
+          (claims-penalty (* (get claims-filed profile) u15))
+          (payment-penalty (* (get payment-delays profile) u8))
+          (good-behavior-bonus (if (and (> (- stacks-block-height (get last-risk-update profile)) u8640)
+                                       (is-eq (get claims-filed profile) u0))
+                                 u10
+                                 u0)))
+        (+ (- (- base-score claims-penalty) payment-penalty) good-behavior-bonus)))
+
+(define-public (update-user-risk-profile (user principal))
+    (let ((current-profile (default-to {risk-score: u50, claims-filed: u0, successful-claims: u0, payment-delays: u0, last-risk-update: u0, premium-discount: u0}
+                                     (map-get? user-risk-profile user)))
+          (new-risk-score (calculate-risk-score user))
+          (discount-percentage (if (<= new-risk-score u30) u15
+                                (if (<= new-risk-score u40) u10
+                                 (if (<= new-risk-score u60) u0
+                                  (if (<= new-risk-score u80) u0
+                                   u20))))))
+        (map-set user-risk-profile user
+            (merge current-profile {risk-score: new-risk-score, 
+                                   last-risk-update: stacks-block-height,
+                                   premium-discount: discount-percentage}))
+        (ok {risk-score: new-risk-score, discount: discount-percentage})))
+
+(define-public (calculate-dynamic-premium (user principal) (device-type (string-ascii 20)))
+    (let ((risk-factors (map-get? device-risk-factors device-type))
+          (user-profile (map-get? user-risk-profile user))
+          (base-premium (var-get monthly-premium)))
+        (match risk-factors
+            device-factor
+            (match user-profile
+                profile
+                (let ((device-multiplier (get premium-multiplier device-factor))
+                      (user-discount (get premium-discount profile))
+                      (adjusted-premium (/ (* base-premium device-multiplier) u100))
+                      (final-premium (- adjusted-premium (/ (* adjusted-premium user-discount) u100))))
+                    (ok final-premium))
+                (ok base-premium))
+            (ok base-premium))))
+
+(define-public (register-device-with-risk-assessment (imei (string-ascii 15)) (device-type (string-ascii 20)))
+    (let ((existing-device (get imei (map-get? insured-devices tx-sender)))
+          (dynamic-premium-result (unwrap-panic (calculate-dynamic-premium tx-sender device-type))))
+        (asserts! (is-none existing-device) ERR-ALREADY-INSURED)
+        (unwrap-panic (update-user-risk-profile tx-sender))
+        (try! (stx-transfer? dynamic-premium-result tx-sender (as-contract tx-sender)))
+        (var-set insurance-pool (+ (var-get insurance-pool) dynamic-premium-result))
+        (ok (map-set insured-devices 
+            tx-sender 
+            {imei: imei, last-payment: stacks-block-height}))))
+
+(define-public (record-claim-outcome (claim-owner principal) (successful bool))
+    (let ((current-profile (default-to {risk-score: u50, claims-filed: u0, successful-claims: u0, payment-delays: u0, last-risk-update: u0, premium-discount: u0}
+                                     (map-get? user-risk-profile claim-owner)))
+          (new-successful-claims (if successful (+ (get successful-claims current-profile) u1) (get successful-claims current-profile))))
+        (map-set user-risk-profile claim-owner
+            (merge current-profile {claims-filed: (+ (get claims-filed current-profile) u1),
+                                   successful-claims: new-successful-claims}))
+        (unwrap-panic (update-user-risk-profile claim-owner))
+        (ok true)))
+
+(define-public (record-payment-delay (user principal))
+    (let ((current-profile (default-to {risk-score: u50, claims-filed: u0, successful-claims: u0, payment-delays: u0, last-risk-update: u0, premium-discount: u0}
+                                     (map-get? user-risk-profile user))))
+        (map-set user-risk-profile user
+            (merge current-profile {payment-delays: (+ (get payment-delays current-profile) u1)}))
+        (unwrap-panic (update-user-risk-profile user))
+        (ok true)))
+
+(define-read-only (get-user-risk-profile (user principal))
+    (ok (map-get? user-risk-profile user)))
+
+(define-read-only (get-device-risk-factors (device-type (string-ascii 20)))
+    (ok (map-get? device-risk-factors device-type)))
+
+(define-read-only (get-premium-quote (user principal) (device-type (string-ascii 20)))
+    (calculate-dynamic-premium user device-type))
