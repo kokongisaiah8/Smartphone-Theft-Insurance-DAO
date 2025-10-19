@@ -1,0 +1,10 @@
+node_modules/
+.cache/
+coverage/
+dist/
+*.log
+.DS_Store
+.env
+.env.local
+settings/Devnet.toml
+settings/Testnet.toml

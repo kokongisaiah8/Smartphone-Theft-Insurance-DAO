@@ -1,0 +1,29 @@
+﻿[network]
+name = "simnet"
+
+[accounts.deployer]
+mnemonic = "twice kind fence tip hidden tilt action fragile skin nothing glory cousin green tomorrow spring wrist shed math olympic multiply hip blue scout early"
+balance = 1000000000000000
+
+[accounts.wallet_1]
+mnemonic = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon"
+balance = 1000000000000000
+
+[accounts.wallet_2]
+mnemonic = "hold excess unusual excess ring elephant install account glad dry fragile donkey gaze humble truck breeze nation gasp vacuum limb head keep delay hospital"
+balance = 1000000000000000
+
+[accounts.wallet_3]
+mnemonic = "board list obtain sugar hour worth raven scout denial thunder horse logic fury scholar dune under shelter exact source script lunch venture soft cotton"
+balance = 1000000000000000
+
+[accounts.wallet_4]
+mnemonic = "anchor border keen haste moral ethics rug sound sausage tooth rebel develop digital unknown inch excuse narrow stool useful note dimension attempt soft glare"
+balance = 1000000000000000
+
+[devnet]
+enable_subnet_node = false
+
+[contracts.smartphone-theft-insurance-dao]
+path = "contracts/smartphone-theft-insurance-dao.clar"
+depends_on = []
