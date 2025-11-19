@@ -1,0 +1,25 @@
+﻿[project]
+name = 'smartphone-theft-insurance-dao'
+description = 'Decentralized insurance platform for protecting smartphone users against theft'
+authors = ['kokongisaiah8@gmail.com']
+telemetry = true
+cache_dir = './.cache'
+requirements = []
+
+[contracts.smartphone-theft-insurance-dao]
+path = 'contracts/smartphone-theft-insurance-dao.clar'
+clarity_version = 3
+epoch = 3.1
+
+[repl.analysis]
+passes = ['check_checker']
+
+[repl.analysis.check_checker]
+strict = false
+trusted_sender = false
+trusted_caller = false
+callee_filter = false
+
+[repl.remote_data]
+enabled = false
+api_url = 'https://api.hiro.so'
