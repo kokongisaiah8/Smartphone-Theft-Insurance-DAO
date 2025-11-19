@@ -1,4 +1,4 @@
-(define-constant ERR-NOT-AUTHORIZED (err u100))
+﻿(define-constant ERR-NOT-AUTHORIZED (err u100))
 (define-constant ERR-INSUFFICIENT-FUNDS (err u101))
 (define-constant ERR-INVALID-IMEI (err u102))
 (define-constant ERR-ALREADY-INSURED (err u103))
@@ -8,8 +8,8 @@
 (define-constant ERR-INVALID-VOTE (err u107))
 
 (define-data-var insurance-pool uint u0)
-(define-data-var monthly-premium uint u10000000) ;; 10 STX
-(define-data-var claim-payout uint u1000000000) ;; 1000 STX
+(define-data-var monthly-premium uint u10000000)
+(define-data-var claim-payout uint u1000000000)
 (define-data-var vote-threshold uint u5)
 
 (define-map insured-devices 
@@ -87,7 +87,7 @@
 (define-read-only (get-insurance-pool)
     (ok (var-get insurance-pool)))
 
-    (define-constant ERR-POLICY-EXPIRED (err u108))
+(define-constant ERR-POLICY-EXPIRED (err u108))
 (define-constant ERR-GRACE-PERIOD-EXPIRED (err u109))
 
 (define-data-var grace-period-blocks uint u1440)
@@ -136,6 +136,7 @@
                 {imei: (get imei (unwrap-panic device)), last-payment: stacks-block-height})
             (map-set policy-status tx-sender {active: true, grace-period-start: none})
             (ok total-payment))))
+
 (define-public (reinstate-expired-policy (imei (string-ascii 15)))
     (let ((status-check (unwrap-panic (check-policy-status tx-sender))))
         (asserts! (is-eq (get status status-check) "expired") ERR-NOT-AUTHORIZED)
@@ -162,6 +163,7 @@
                         {status: "grace-period", blocks-overdue: (- blocks-since-payment payment-due-blocks)}
                         {status: "expired", blocks-overdue: (- blocks-since-payment payment-due-blocks)})))
             {status: "not-insured", blocks-overdue: u0})))
+
 (define-constant ERR-NOT-VALIDATOR (err u110))
 (define-constant ERR-VALIDATOR-EXISTS (err u111))
 (define-constant ERR-INSUFFICIENT-STAKE (err u112))
@@ -435,3 +437,132 @@
 
 (define-read-only (get-premium-quote (user principal) (device-type (string-ascii 20)))
     (calculate-dynamic-premium user device-type))
+
+(define-constant ERR-ALREADY-REFERRED (err u117))
+(define-constant ERR-SELF-REFERRAL (err u118))
+(define-constant ERR-REFERRER-NOT-FOUND (err u119))
+(define-constant ERR-INSUFFICIENT-POOL (err u120))
+
+(define-data-var referral-reward uint u5000000)
+(define-data-var loyalty-reward-threshold uint u12)
+(define-data-var loyalty-reward-amount uint u3000000)
+
+(define-map user-referrals
+    principal
+    {referrer: (optional principal), 
+     referral-count: uint, 
+     total-rewards-earned: uint}
+)
+
+(define-map loyalty-tracker
+    principal
+    {consecutive-payments: uint, 
+     total-payments: uint, 
+     last-claim-block: uint, 
+     lifetime-rewards: uint}
+)
+
+(define-map referral-ledger
+    {referrer: principal, referee: principal}
+    {timestamp: uint, reward-claimed: bool}
+)
+
+(define-public (register-with-referral (imei (string-ascii 15)) (referrer principal))
+    (let ((existing-device (get imei (map-get? insured-devices tx-sender)))
+          (existing-referral (map-get? user-referrals tx-sender))
+          (referrer-info (map-get? insured-devices referrer)))
+        (asserts! (is-none existing-device) ERR-ALREADY-INSURED)
+        (asserts! (not (is-eq tx-sender referrer)) ERR-SELF-REFERRAL)
+        (asserts! (is-some referrer-info) ERR-REFERRER-NOT-FOUND)
+        (asserts! (is-none existing-referral) ERR-ALREADY-REFERRED)
+        (try! (stx-transfer? (var-get monthly-premium) tx-sender (as-contract tx-sender)))
+        (var-set insurance-pool (+ (var-get insurance-pool) (var-get monthly-premium)))
+        (map-set insured-devices tx-sender {imei: imei, last-payment: stacks-block-height})
+        (map-set user-referrals tx-sender 
+            {referrer: (some referrer), referral-count: u0, total-rewards-earned: u0})
+        (map-set referral-ledger {referrer: referrer, referee: tx-sender}
+            {timestamp: stacks-block-height, reward-claimed: false})
+        (let ((referrer-data (default-to {referrer: none, referral-count: u0, total-rewards-earned: u0}
+                                       (map-get? user-referrals referrer))))
+            (map-set user-referrals referrer
+                {referrer: (get referrer referrer-data),
+                 referral-count: (+ (get referral-count referrer-data) u1),
+                 total-rewards-earned: (get total-rewards-earned referrer-data)})
+            (ok true))))
+
+(define-public (claim-referral-reward (referee principal))
+    (let ((ledger-entry (map-get? referral-ledger {referrer: tx-sender, referee: referee}))
+          (referrer-data (map-get? user-referrals tx-sender))
+          (referee-device (map-get? insured-devices referee)))
+        (asserts! (is-some ledger-entry) ERR-REFERRER-NOT-FOUND)
+        (asserts! (not (get reward-claimed (unwrap-panic ledger-entry))) ERR-ALREADY-REFERRED)
+        (asserts! (is-some referee-device) ERR-NOT-INSURED)
+        (asserts! (>= (var-get insurance-pool) (var-get referral-reward)) ERR-INSUFFICIENT-POOL)
+        (try! (as-contract (stx-transfer? (var-get referral-reward) tx-sender tx-sender)))
+        (var-set insurance-pool (- (var-get insurance-pool) (var-get referral-reward)))
+        (map-set referral-ledger {referrer: tx-sender, referee: referee}
+            (merge (unwrap-panic ledger-entry) {reward-claimed: true}))
+        (let ((updated-data (unwrap-panic referrer-data)))
+            (map-set user-referrals tx-sender
+                (merge updated-data {total-rewards-earned: (+ (get total-rewards-earned updated-data) (var-get referral-reward))}))
+            (ok (var-get referral-reward)))))
+
+(define-public (track-loyalty-payment)
+    (let ((device (map-get? insured-devices tx-sender))
+          (loyalty-data (default-to {consecutive-payments: u0, total-payments: u0, last-claim-block: u0, lifetime-rewards: u0}
+                                   (map-get? loyalty-tracker tx-sender))))
+        (asserts! (is-some device) ERR-NOT-INSURED)
+        (let ((payment-gap (- stacks-block-height (get last-claim-block loyalty-data)))
+              (consecutive (if (<= payment-gap u4320) 
+                             (+ (get consecutive-payments loyalty-data) u1)
+                             u1)))
+            (map-set loyalty-tracker tx-sender
+                {consecutive-payments: consecutive,
+                 total-payments: (+ (get total-payments loyalty-data) u1),
+                 last-claim-block: stacks-block-height,
+                 lifetime-rewards: (get lifetime-rewards loyalty-data)})
+            (ok consecutive))))
+
+(define-public (claim-loyalty-reward)
+    (let ((loyalty-data (map-get? loyalty-tracker tx-sender)))
+        (asserts! (is-some loyalty-data) ERR-NOT-INSURED)
+        (let ((data (unwrap-panic loyalty-data)))
+            (asserts! (>= (get consecutive-payments data) (var-get loyalty-reward-threshold)) ERR-NOT-AUTHORIZED)
+            (asserts! (>= (var-get insurance-pool) (var-get loyalty-reward-amount)) ERR-INSUFFICIENT-POOL)
+            (try! (as-contract (stx-transfer? (var-get loyalty-reward-amount) tx-sender tx-sender)))
+            (var-set insurance-pool (- (var-get insurance-pool) (var-get loyalty-reward-amount)))
+            (map-set loyalty-tracker tx-sender
+                {consecutive-payments: u0,
+                 total-payments: (get total-payments data),
+                 last-claim-block: (get last-claim-block data),
+                 lifetime-rewards: (+ (get lifetime-rewards data) (var-get loyalty-reward-amount))})
+            (ok (var-get loyalty-reward-amount)))))
+
+(define-public (pay-premium-with-loyalty-tracking)
+    (let ((device (map-get? insured-devices tx-sender)))
+        (asserts! (is-some device) ERR-NOT-INSURED)
+        (try! (stx-transfer? (var-get monthly-premium) tx-sender (as-contract tx-sender)))
+        (var-set insurance-pool (+ (var-get insurance-pool) (var-get monthly-premium)))
+        (map-set insured-devices tx-sender
+            {imei: (get imei (unwrap-panic device)), last-payment: stacks-block-height})
+        (unwrap-panic (track-loyalty-payment))
+        (ok true)))
+
+(define-read-only (get-referral-stats (user principal))
+    (ok (map-get? user-referrals user)))
+
+(define-read-only (get-loyalty-stats (user principal))
+    (ok (map-get? loyalty-tracker user)))
+
+(define-read-only (get-referral-ledger-entry (referrer principal) (referee principal))
+    (ok (map-get? referral-ledger {referrer: referrer, referee: referee})))
+
+(define-read-only (calculate-total-user-rewards (user principal))
+    (let ((referral-data (map-get? user-referrals user))
+          (loyalty-data (map-get? loyalty-tracker user)))
+        (ok {referral-rewards: (match referral-data 
+                                 data (get total-rewards-earned data)
+                                 u0),
+             loyalty-rewards: (match loyalty-data
+                               data (get lifetime-rewards data)
+                               u0)})))
