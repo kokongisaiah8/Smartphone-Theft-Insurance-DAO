@@ -1,4 +1,4 @@
-﻿(define-constant contract-owner tx-sender)
+(define-constant contract-owner tx-sender)
 (define-constant err-owner-only (err u100))
 (define-constant err-not-found (err u101))
 (define-constant err-unauthorized (err u102))
@@ -10,6 +10,8 @@
 (define-constant err-already-voted (err u108))
 (define-constant err-voting-ended (err u109))
 (define-constant err-claim-not-approved (err u110))
+(define-constant err-self-referral (err u111))
+(define-constant err-no-rewards (err u112))
 
 (define-data-var policy-counter uint u0)
 (define-data-var claim-counter uint u0)
@@ -17,6 +19,7 @@
 (define-data-var base-premium uint u1000000)
 (define-data-var coverage-amount uint u10000000)
 (define-data-var voting-period uint u1440)
+(define-data-var referral-reward uint u10000)
 
 (define-map policies
     uint
@@ -34,6 +37,7 @@
 )
 
 (define-map user-policies principal (list 50 uint))
+(define-map referral-balances principal uint)
 
 (define-map claims
     uint
@@ -253,10 +257,69 @@
     )
 )
 
+(define-read-only (get-referral-balance (user principal))
+    (ok (default-to u0 (map-get? referral-balances user)))
+)
+
 (define-public (contribute-to-pool (amount uint))
     (begin
         (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
         (var-set pool-balance (+ (var-get pool-balance) amount))
+        (ok true)
+    )
+)
+
+(define-public (purchase-policy-with-referral (device-id (string-ascii 64)) (referrer principal))
+    (let
+        (
+            (policy-id (+ (var-get policy-counter) u1))
+            (premium (var-get base-premium))
+            (coverage (var-get coverage-amount))
+            (duration u52560)
+        )
+        (asserts! (not (is-eq tx-sender referrer)) err-self-referral)
+        (try! (stx-transfer? premium tx-sender (as-contract tx-sender)))
+        (var-set pool-balance (+ (var-get pool-balance) premium))
+        (var-set policy-counter policy-id)
+        (map-set policies policy-id
+            {
+                owner: tx-sender,
+                device-id: device-id,
+                premium: premium,
+                coverage: coverage,
+                start-block: stacks-block-height,
+                end-block: (+ stacks-block-height duration),
+                active: true,
+                claim-count: u0,
+                tenure-months: u0
+            }
+        )
+        (map-set user-policies tx-sender
+            (unwrap! (as-max-len? (append (default-to (list) (map-get? user-policies tx-sender)) policy-id) u50) err-invalid-amount)
+        )
+        (map-set referral-balances referrer (+ (default-to u0 (map-get? referral-balances referrer)) (var-get referral-reward)))
+        (ok policy-id)
+    )
+)
+
+(define-public (claim-referral-rewards)
+    (let
+        (
+            (recipient tx-sender)
+            (amount (default-to u0 (map-get? referral-balances tx-sender)))
+        )
+        (asserts! (> amount u0) err-no-rewards)
+        (try! (as-contract (stx-transfer? amount tx-sender recipient)))
+        (var-set pool-balance (- (var-get pool-balance) amount))
+        (map-set referral-balances tx-sender u0)
+        (ok amount)
+    )
+)
+
+(define-public (update-referral-reward (new-reward uint))
+    (begin
+        (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+        (var-set referral-reward new-reward)
         (ok true)
     )
 )
