@@ -566,3 +566,153 @@
              loyalty-rewards: (match loyalty-data
                                data (get lifetime-rewards data)
                                u0)})))
+
+(define-constant ERR-NO-DISPUTE (err u121))
+(define-constant ERR-DISPUTE-EXISTS (err u122))
+(define-constant ERR-DISPUTE-EXPIRED (err u123))
+(define-constant ERR-NOT-ARBITRATOR (err u124))
+(define-constant ERR-INVALID-EVIDENCE (err u125))
+
+(define-data-var dispute-window-blocks uint u2880)
+(define-data-var arbitration-fee uint u2000000)
+(define-data-var arbitrator-reward uint u1000000)
+
+(define-map claim-disputes
+    principal
+    {dispute-reason: (string-ascii 200),
+     evidence-hash: (string-ascii 64),
+     filed-at: uint,
+     arbitrator: (optional principal),
+     resolution: (optional bool),
+     resolved-at: (optional uint)}
+)
+
+(define-map arbitrators
+    principal
+    {stake: uint,
+     cases-resolved: uint,
+     accuracy-score: uint,
+     is-active: bool}
+)
+
+(define-map arbitration-votes
+    {dispute-owner: principal, arbitrator: principal}
+    {decision: bool, reasoning-hash: (string-ascii 64), voted-at: uint}
+)
+
+(define-public (register-arbitrator)
+    (let ((existing-arbitrator (map-get? arbitrators tx-sender)))
+        (asserts! (is-none existing-arbitrator) ERR-VALIDATOR-EXISTS)
+        (try! (stx-transfer? (var-get validator-stake-required) tx-sender (as-contract tx-sender)))
+        (map-set arbitrators tx-sender
+            {stake: (var-get validator-stake-required),
+             cases-resolved: u0,
+             accuracy-score: u100,
+             is-active: true})
+        (ok true)))
+
+(define-public (file-dispute (reason (string-ascii 200)) (evidence-hash (string-ascii 64)))
+    (let ((claim (map-get? theft-claims tx-sender))
+          (existing-dispute (map-get? claim-disputes tx-sender)))
+        (asserts! (is-some claim) ERR-NO-CLAIM)
+        (asserts! (get processed (unwrap-panic claim)) ERR-INVALID-VOTE)
+        (asserts! (is-none existing-dispute) ERR-DISPUTE-EXISTS)
+        (try! (stx-transfer? (var-get arbitration-fee) tx-sender (as-contract tx-sender)))
+        (var-set insurance-pool (+ (var-get insurance-pool) (var-get arbitration-fee)))
+        (map-set claim-disputes tx-sender
+            {dispute-reason: reason,
+             evidence-hash: evidence-hash,
+             filed-at: stacks-block-height,
+             arbitrator: none,
+             resolution: none,
+             resolved-at: none})
+        (ok true)))
+
+(define-public (accept-arbitration (dispute-owner principal))
+    (let ((arbitrator-info (map-get? arbitrators tx-sender))
+          (dispute (map-get? claim-disputes dispute-owner)))
+        (asserts! (is-some arbitrator-info) ERR-NOT-ARBITRATOR)
+        (asserts! (get is-active (unwrap-panic arbitrator-info)) ERR-NOT-ARBITRATOR)
+        (asserts! (is-some dispute) ERR-NO-DISPUTE)
+        (asserts! (is-none (get arbitrator (unwrap-panic dispute))) ERR-DISPUTE-EXISTS)
+        (map-set claim-disputes dispute-owner
+            (merge (unwrap-panic dispute) {arbitrator: (some tx-sender)}))
+        (ok true)))
+
+(define-public (resolve-dispute (dispute-owner principal) (approve bool) (reasoning-hash (string-ascii 64)))
+    (let ((arbitrator-info (map-get? arbitrators tx-sender))
+          (dispute (map-get? claim-disputes dispute-owner))
+          (claim (map-get? theft-claims dispute-owner)))
+        (asserts! (is-some arbitrator-info) ERR-NOT-ARBITRATOR)
+        (asserts! (is-some dispute) ERR-NO-DISPUTE)
+        (asserts! (is-some claim) ERR-NO-CLAIM)
+        (asserts! (is-eq (get arbitrator (unwrap-panic dispute)) (some tx-sender)) ERR-NOT-ARBITRATOR)
+        (asserts! (is-none (get resolution (unwrap-panic dispute))) ERR-DISPUTE-EXISTS)
+        (let ((blocks-elapsed (- stacks-block-height (get filed-at (unwrap-panic dispute)))))
+            (asserts! (<= blocks-elapsed (var-get dispute-window-blocks)) ERR-DISPUTE-EXPIRED)
+            (map-set arbitration-votes
+                {dispute-owner: dispute-owner, arbitrator: tx-sender}
+                {decision: approve, reasoning-hash: reasoning-hash, voted-at: stacks-block-height})
+            (map-set claim-disputes dispute-owner
+                (merge (unwrap-panic dispute) 
+                       {resolution: (some approve), resolved-at: (some stacks-block-height)}))
+            (map-set arbitrators tx-sender
+                (merge (unwrap-panic arbitrator-info)
+                       {cases-resolved: (+ (get cases-resolved (unwrap-panic arbitrator-info)) u1)}))
+            (if approve
+                (begin
+                    (try! (as-contract (stx-transfer? (var-get claim-payout) tx-sender dispute-owner)))
+                    (var-set insurance-pool (- (var-get insurance-pool) (var-get claim-payout)))
+                    (try! (as-contract (stx-transfer? (var-get arbitrator-reward) tx-sender tx-sender)))
+                    (var-set insurance-pool (- (var-get insurance-pool) (var-get arbitrator-reward)))
+                    (ok true))
+                (begin
+                    (try! (as-contract (stx-transfer? (var-get arbitrator-reward) tx-sender tx-sender)))
+                    (var-set insurance-pool (- (var-get insurance-pool) (var-get arbitrator-reward)))
+                    (ok false))))))
+
+(define-public (withdraw-arbitrator-stake)
+    (let ((arbitrator-info (map-get? arbitrators tx-sender)))
+        (asserts! (is-some arbitrator-info) ERR-NOT-ARBITRATOR)
+        (try! (as-contract (stx-transfer? (get stake (unwrap-panic arbitrator-info)) tx-sender tx-sender)))
+        (map-delete arbitrators tx-sender)
+        (ok (get stake (unwrap-panic arbitrator-info)))))
+
+(define-public (deactivate-arbitrator)
+    (let ((arbitrator-info (map-get? arbitrators tx-sender)))
+        (asserts! (is-some arbitrator-info) ERR-NOT-ARBITRATOR)
+        (map-set arbitrators tx-sender
+            (merge (unwrap-panic arbitrator-info) {is-active: false}))
+        (ok true)))
+
+(define-public (reactivate-arbitrator)
+    (let ((arbitrator-info (map-get? arbitrators tx-sender)))
+        (asserts! (is-some arbitrator-info) ERR-NOT-ARBITRATOR)
+        (map-set arbitrators tx-sender
+            (merge (unwrap-panic arbitrator-info) {is-active: true}))
+        (ok true)))
+
+(define-read-only (get-dispute-info (owner principal))
+    (ok (map-get? claim-disputes owner)))
+
+(define-read-only (get-arbitrator-info (arbitrator principal))
+    (ok (map-get? arbitrators arbitrator)))
+
+(define-read-only (get-arbitration-decision (dispute-owner principal) (arbitrator principal))
+    (ok (map-get? arbitration-votes {dispute-owner: dispute-owner, arbitrator: arbitrator})))
+
+(define-read-only (check-dispute-status (owner principal))
+    (let ((dispute (map-get? claim-disputes owner)))
+        (match dispute
+            dispute-data
+            (let ((blocks-elapsed (- stacks-block-height (get filed-at dispute-data))))
+                (ok {dispute-active: (is-none (get resolution dispute-data)),
+                     time-remaining: (if (> (var-get dispute-window-blocks) blocks-elapsed)
+                                       (- (var-get dispute-window-blocks) blocks-elapsed)
+                                       u0),
+                     has-arbitrator: (is-some (get arbitrator dispute-data)),
+                     is-resolved: (is-some (get resolution dispute-data))}))
+            (ok {dispute-active: false,
+                 time-remaining: u0,
+                 has-arbitrator: false,
+                 is-resolved: false}))))
